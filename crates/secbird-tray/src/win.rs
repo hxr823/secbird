@@ -1358,7 +1358,7 @@ fn set_clipboard(text: &str) -> bool {
 }
 
 
-/// The tray variant of the logo (white background, resource id 2 from build.rs), at the
+/// The notification-area logo (resource id 2), at the
 /// small-icon size Windows uses for the notification area. Resource 1 is the app icon.
 unsafe fn load_icon() -> HICON {
     let icon = LoadImageW(
