@@ -45,7 +45,7 @@ pub struct Battery {
     pub key: String,
     pub name: String,
     pub percent: u8,
-    pub charging: bool,
+    pub charging: Option<bool>,
 }
 
 /// A connected Razer product that can't be controlled (yet), shown so it isn't silently missing.
@@ -203,7 +203,7 @@ impl Engine {
             .iter()
             .filter_map(|d| {
                 let percent = d.battery().ok().flatten()?;
-                Some(Battery { key: d.key(), name: d.name(), percent, charging: d.charging().unwrap_or(false) })
+                Some(Battery { key: d.key(), name: d.name(), percent, charging: d.charging().ok() })
             })
             .collect()
     }

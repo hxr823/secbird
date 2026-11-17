@@ -1,0 +1,54 @@
+name: Custom Windows build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --locked --release
+      - name: Build
+        run: cargo build --locked --release
+      - name: Build installer
+        run: |
+          choco install innosetup --no-progress -y
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" //Qp "//DAppVersion=$version" installer/secbird.iss
+      - name: Package portable build
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p dist/Secretarybird
+          cp target/release/secbird-tray.exe target/release/secbird.exe README.md LICENSE-MIT LICENSE-APACHE dist/Secretarybird/
+          cp NOTICE dist/Secretarybird/NOTICE.txt
+          cp "target/installer/Secretarybird-Setup-$version.exe" "dist/Secretarybird-Custom-Setup-$version.exe"
+          (cd dist && 7z a -tzip "Secretarybird-$version-custom-portable.zip" Secretarybird >/dev/null && rm -r Secretarybird)
+      - name: Verify installer and startup registration
+        shell: pwsh
+        run: |
+          $setup = Get-Item 'dist/Secretarybird-Custom-Setup-*.exe'
+          $installDir = Join-Path $env:RUNNER_TEMP 'Secretarybird'
+          $args = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /TASKS=autostart /DIR=`"$installDir`""
+          $process = Start-Process -FilePath $setup.FullName -ArgumentList $args -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exited with code $($process.ExitCode)" }
+          $tray = Join-Path $installDir 'secbird-tray.exe'
+          if (!(Test-Path $tray) -or !(Test-Path (Join-Path $installDir 'secbird.exe'))) {
+            throw 'The installer did not install both Secretarybird executables.'
+          }
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          $startup = Get-ItemPropertyValue -Path $runKey -Name Secretarybird
+          if ($startup -ne ('"' + $tray + '"')) { throw "Unexpected startup entry: $startup" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Secretarybird-custom-Windows
+          path: dist/*
+          if-no-files-found: error

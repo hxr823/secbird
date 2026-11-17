@@ -51,7 +51,11 @@ const SLEEPER_RETRY_MS: u32 = 60_000;
 const SLEEPER_RETRIES: usize = 30;
 /// Battery check for wireless devices (cheap: two short USB requests per device).
 const TIMER_BATTERY: usize = 3;
-const BATTERY_MS: u32 = 5 * 60 * 1000;
+const HEADSET_ICON_ID: u32 = 2;
+const MOUSE_ICON_ID: u32 = 3;
+const HEADSET_ICON_GUID: GUID = GUID::from_u128(0x4100074e_496d_45f3_80b9_9aa8fa3a16be);
+const MOUSE_ICON_GUID: GUID = GUID::from_u128(0x0f45b491_3b51_4bb0_a097_f89740e8bb12);
+const BATTERY_MS: u32 = 30_000;
 /// Devices need a moment after arrival or resume before they answer reliably.
 const SETTLE_MS: u32 = 1500;
 /// Wait for the window in front to settle, so Alt+Tab through several windows sends
@@ -119,6 +123,9 @@ struct App {
     /// Devices already warned about low battery (cleared once charging or recovered).
     low_battery: HashSet<String>,
     batteries: Vec<Battery>,
+    /// Whether the dedicated headset and mouse battery tray icons are installed.
+    headset_tray_added: bool,
+    mouse_tray_added: bool,
     /// When each mouse last got its lost remaps back (device key -> unix seconds).
     buttons_restored: HashMap<String, u64>,
     /// Event collections with a listener thread; a thread removes its path when the
@@ -314,6 +321,8 @@ pub fn run() {
                 low_battery: HashSet::new(),
                 buttons_restored: HashMap::new(),
                 batteries: Vec::new(),
+                headset_tray_added: false,
+                mouse_tray_added: false,
                 listening: Arc::new(Mutex::new(HashSet::new())),
                 events_tx,
                 events,
@@ -510,13 +519,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
         WM_DESTROY => {
-            with_app(|app| remove_icon(app.hwnd));
+            with_app(|app| {
+                remove_icon(app.hwnd);
+                remove_icon_with_id(app.hwnd, HEADSET_ICON_ID);
+                remove_icon_with_id(app.hwnd, MOUSE_ICON_ID);
+            });
             PostQuitMessage(0);
             0
         }
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
             with_app(|app| {
                 add_icon(app.hwnd, app.icon);
+                app.headset_tray_added = false;
+                app.mouse_tray_added = false;
+                app.update_battery_icons();
                 app.update_tooltip();
             });
             0
@@ -747,7 +763,7 @@ impl App {
         let settings = TraySettings::load();
         let low = settings.low_battery();
         for b in &batteries {
-            if b.charging || b.percent >= low.saturating_add(10) {
+            if b.charging == Some(true) || b.percent >= low.saturating_add(10) {
                 self.low_battery.remove(&b.key);
             } else if b.percent <= low && self.low_battery.insert(b.key.clone()) {
                 log::append(&format!("low battery: {} {}%", b.name, b.percent));
@@ -757,6 +773,7 @@ impl App {
             }
         }
         self.batteries = batteries;
+        self.update_battery_icons();
         self.update_tooltip();
     }
 
@@ -777,6 +794,23 @@ impl App {
         }
     }
 
+    /// Show the headset and mouse battery as two independent taskbar icons.
+    fn update_battery_icons(&mut self) {
+        let headset = self.batteries.iter().find(|b| {
+            let pid = b.key.split(':').next().unwrap_or_default();
+            matches!(pid, "0576" | "0577")
+        });
+        // Some receivers use their own PID, but Secretarybird resolves the product name.
+        let mouse = self.batteries.iter().find(|b| {
+            b.name == "Viper V3 Pro" || b.name.starts_with("Viper V3 Pro (")
+        });
+
+        unsafe {
+            update_battery_icon(self.hwnd, HEADSET_ICON_ID, 1000, headset, &mut self.headset_tray_added);
+            update_battery_icon(self.hwnd, MOUSE_ICON_ID, 1200, mouse, &mut self.mouse_tray_added);
+        }
+    }
+
     fn update_tooltip(&self) {
         let mut text = format!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"));
         let engine = self.engine();
@@ -792,7 +826,7 @@ impl App {
                 }
             }
             let battery = match self.batteries.iter().find(|b| b.key == dev.key()) {
-                Some(b) if b.charging => format!(" · {}% charging", b.percent),
+                Some(b) if b.charging == Some(true) => format!(" · {}% charging", b.percent),
                 Some(b) => format!(" · {}%", b.percent),
                 None => String::new(),
             };
@@ -1185,14 +1219,24 @@ unsafe fn show_menu(hwnd: HWND) {
     }
 }
 
-unsafe fn icon_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
+unsafe fn icon_data_with_id(hwnd: HWND, icon: HICON, id: u32) -> NOTIFYICONDATAW {
     let mut nid: NOTIFYICONDATAW = zeroed();
     nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
     nid.hWnd = hwnd;
-    nid.uID = 1;
+    nid.uID = id;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = icon;
+    nid.guidItem = match id {
+        HEADSET_ICON_ID => HEADSET_ICON_GUID,
+        MOUSE_ICON_ID => MOUSE_ICON_GUID,
+        _ => return nid,
+    };
+    nid.uFlags = NIF_GUID;
     nid
+}
+
+unsafe fn icon_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
+    icon_data_with_id(hwnd, icon, 1)
 }
 
 unsafe fn add_icon(hwnd: HWND, icon: HICON) {
@@ -1202,9 +1246,54 @@ unsafe fn add_icon(hwnd: HWND, icon: HICON) {
     Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
-unsafe fn remove_icon(hwnd: HWND) {
-    let nid = icon_data(hwnd, null_mut());
+unsafe fn remove_icon_with_id(hwnd: HWND, id: u32) {
+    let nid = icon_data_with_id(hwnd, null_mut(), id);
     Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+unsafe fn remove_icon(hwnd: HWND) {
+    remove_icon_with_id(hwnd, 1);
+}
+
+/// Add or update one numbered battery icon using the existing battery sample.
+unsafe fn update_battery_icon(
+    hwnd: HWND,
+    tray_id: u32,
+    resource_base: u16,
+    battery: Option<&Battery>,
+    added: &mut bool,
+) {
+    let Some(battery) = battery else {
+        if *added {
+            remove_icon_with_id(hwnd, tray_id);
+            *added = false;
+        }
+        return;
+    };
+    let resource_id = resource_base + u16::from(battery.percent.min(100));
+    let icon = LoadImageW(
+        GetModuleHandleW(null()),
+        resource_id as usize as _,
+        IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON),
+        GetSystemMetrics(SM_CYSMICON),
+        LR_DEFAULTCOLOR | LR_SHARED,
+    ) as HICON;
+    if icon.is_null() {
+        return;
+    }
+    let state = match battery.charging {
+        Some(true) => "Charging",
+        Some(false) => "Not charging",
+        None => "Charging status unavailable",
+    };
+    let tooltip = format!("{} · {}% · {state}", battery.name, battery.percent);
+    let mut nid = icon_data_with_id(hwnd, icon, tray_id);
+    nid.uFlags |= NIF_ICON | NIF_TIP;
+    copy_wide(&mut nid.szTip, &tooltip);
+    if !*added || Shell_NotifyIconW(NIM_MODIFY, &nid) == 0 {
+        *added = Shell_NotifyIconW(NIM_ADD, &nid) != 0;
+    }
 }
 
 unsafe fn register_hid_notifications(hwnd: HWND) {
